@@ -1,4 +1,3 @@
-
 """Load CSV files into an isolated SQL Server workspace."""
 
 import csv
@@ -8,13 +7,15 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 
+import pyodbc
+
 from utils.db_conn import DatabaseUtil
 from utils.workspace_manager import WorkspaceManager
-
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_ROWS = 100_000
 MAX_COLUMNS = 150
+BATCH_SIZE = 1000
 
 
 def quote_identifier(value: str) -> str:
@@ -57,80 +58,102 @@ def unique_headers(headers: list[str]) -> list[str]:
 
 def infer_sql_type(values: list[str]) -> str:
     """Infer a conservative SQL Server data type."""
-
     nonempty = [
-        value.strip()
-        for value in values
-        if value is not None and value.strip() != ""
+        v.strip() for v in values if v is not None and str(v).strip() != ""
     ]
 
     if not nonempty:
         return "NVARCHAR(MAX)"
 
     # Integer detection
-    if all(re.fullmatch(r"[+-]?\d+", value) for value in nonempty):
-        numbers = [int(value) for value in nonempty]
-
-        if all(-(2**31) <= n <= 2**31 - 1 for n in numbers):
-            return "INT"
-
-        if all(-(2**63) <= n <= 2**63 - 1 for n in numbers):
-            return "BIGINT"
-
+    if all(re.fullmatch(r"[+-]?\d+", v) for v in nonempty):
+        try:
+            nums = [int(v) for v in nonempty]
+            if all(-(2**31) <= n <= 2**31 - 1 for n in nums):
+                return "INT"
+            if all(-(2**63) <= n <= 2**63 - 1 for n in nums):
+                return "BIGINT"
+        except ValueError:
+            pass
         return "NVARCHAR(MAX)"
 
     # Decimal detection
-    decimal_pattern = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
-
-    if all(re.fullmatch(decimal_pattern, value) for value in nonempty):
+    if all(re.fullmatch(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$", v) for v in nonempty):
         try:
-            decimals = [Decimal(value) for value in nonempty]
-
-            if all(number.is_finite() for number in decimals):
-                scales = [
-                    max(-number.as_tuple().exponent, 0)
-                    for number in decimals
-                ]
-
+            decimals = [Decimal(v) for v in nonempty]
+            if all(n.is_finite() for n in decimals):
+                scales = [max(-n.as_tuple().exponent, 0) for n in decimals]
                 integer_digits = [
-                    max(
-                        len(number.as_tuple().digits)
-                        + number.as_tuple().exponent,
-                        0,
-                    )
-                    for number in decimals
+                    max(len(n.as_tuple().digits) + n.as_tuple().exponent, 0)
+                    for n in decimals
                 ]
-
                 scale = max(scales)
                 precision = max(integer_digits) + scale
 
                 if 1 <= precision <= 38 and scale <= precision:
                     return f"DECIMAL({max(precision, 1)},{scale})"
-
+                return "FLOAT"
         except (InvalidOperation, ValueError):
             pass
 
-    # ISO date detection
+    # ISO date detection (strictly YYYY-MM-DD)
     try:
-        for value in nonempty:
-            if date.fromisoformat(value).isoformat() != value:
-                raise ValueError
-
-        return "DATE"
+        if all(len(v) == 10 and date.fromisoformat(v).isoformat() == v for v in nonempty):
+            return "DATE"
     except ValueError:
         pass
 
     # ISO datetime detection
     try:
-        for value in nonempty:
-            datetime.fromisoformat(value.replace("Z", "+00:00"))
-
+        is_dt = True
+        for v in nonempty:
+            cleaned = v.replace("Z", "+00:00")
+            datetime.fromisoformat(cleaned)
         return "DATETIME2"
     except ValueError:
         pass
 
-    # Preserve values when their type is uncertain.
+    # General text: size appropriately
+    max_len = max((len(v) for v in nonempty), default=1)
+    if max_len <= 100:
+        return "NVARCHAR(255)"
+    if max_len <= 1000:
+        return "NVARCHAR(2000)"
     return "NVARCHAR(MAX)"
+
+
+def prepare_cell_value(val: str | None, sql_type: str):
+    """Cast string values to native Python types to prevent driver conversion truncation."""
+    if val is None or str(val).strip() == "":
+        return None
+
+    val_str = str(val).strip()
+
+    if sql_type in ("INT", "BIGINT"):
+        try:
+            return int(val_str)
+        except ValueError:
+            return None
+
+    if sql_type.startswith("DECIMAL") or sql_type == "FLOAT":
+        try:
+            return float(val_str)
+        except ValueError:
+            return None
+
+    if sql_type == "DATE":
+        try:
+            return date.fromisoformat(val_str)
+        except ValueError:
+            return None
+
+    if sql_type == "DATETIME2":
+        try:
+            return datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    return val_str
 
 
 class CSVLoader:
@@ -141,9 +164,10 @@ class CSVLoader:
 
     def _parse_csv(self, filename, file_obj):
         """Read and validate one CSV before inserting anything."""
-
         if not filename.lower().endswith(".csv"):
-            raise ValueError(f"Unsupported file: {filename}. Only CSV files are allowed.")
+            raise ValueError(
+                f"Unsupported file: {filename}. Only CSV files are allowed."
+            )
 
         raw = file_obj.read(MAX_FILE_BYTES + 1)
 
@@ -178,11 +202,9 @@ class CSVLoader:
             )
 
         headers = unique_headers(raw_headers)
-
         rows = []
 
         for line_number, row in enumerate(reader, start=2):
-
             if len(row) != len(headers):
                 raise ValueError(
                     f"{filename}: malformed row at line {line_number}. "
@@ -208,28 +230,30 @@ class CSVLoader:
         )
 
         column_types = [
-            infer_sql_type([
-                row[index] or ""
-                for row in rows
-            ])
+            infer_sql_type([row[index] or "" for row in rows])
             for index in range(len(headers))
         ]
+
+        # Convert strings to target Python types matching SQL columns
+        typed_rows = []
+        for row in rows:
+            typed_rows.append([
+                prepare_cell_value(row[idx], column_types[idx])
+                for idx in range(len(headers))
+            ])
 
         return {
             "table_name": table_name,
             "headers": headers,
             "column_types": column_types,
-            "rows": rows,
+            "rows": typed_rows,
         }
 
     def load_multiple(self, workspace_name, files):
         """
         Load multiple CSV files into one workspace.
-
         All files are validated before database insertion.
-        The database changes are committed together.
         """
-
         if not self.workspaces.workspace_exists(workspace_name):
             raise ValueError("Workspace does not exist.")
 
@@ -241,28 +265,21 @@ class CSVLoader:
             for filename, file_obj in files
         ]
 
-        table_names = [
-            item["table_name"].casefold()
-            for item in parsed_files
-        ]
-
+        table_names = [item["table_name"].casefold() for item in parsed_files]
         if len(table_names) != len(set(table_names)):
-            raise ValueError(
-                "Multiple uploaded files produce the same table name."
-            )
+            raise ValueError("Multiple uploaded files produce the same table name.")
 
         schema = quote_identifier(workspace_name)
         connection = self.db.get_connection()
         cursor = connection.cursor()
-
         results = []
 
         try:
             for item in parsed_files:
-
                 table_name = item["table_name"]
                 safe_table = quote_identifier(table_name)
 
+                # Check if table already exists
                 cursor.execute(
                     """
                     SELECT 1
@@ -278,6 +295,7 @@ class CSVLoader:
                         f"Table '{table_name}' already exists in this workspace."
                     )
 
+                # Create table
                 column_definitions = ", ".join(
                     f"{quote_identifier(name)} {sql_type} NULL"
                     for name, sql_type in zip(
@@ -290,28 +308,24 @@ class CSVLoader:
                     f"CREATE TABLE {schema}.{safe_table} "
                     f"({column_definitions})"
                 )
-
                 cursor.execute(create_sql)
 
+                # Prepare insert query
                 column_list = ", ".join(
-                    quote_identifier(name)
-                    for name in item["headers"]
+                    quote_identifier(name) for name in item["headers"]
                 )
-
-                placeholders = ", ".join(
-                    "?" for _ in item["headers"]
-                )
-
+                placeholders = ", ".join("?" for _ in item["headers"])
                 insert_sql = (
                     f"INSERT INTO {schema}.{safe_table} "
                     f"({column_list}) VALUES ({placeholders})"
                 )
 
-               # Disable fast_executemany to avoid ODBC string-buffer
-                # truncation when later rows contain longer strings.
-                cursor.fast_executemany = False
+                # Batch insertion without manual setinputsizes (driver automatically binds typed values)
+                cursor.fast_executemany = True
 
-                cursor.executemany(insert_sql, item["rows"])
+                for start in range(0, len(item["rows"]), BATCH_SIZE):
+                    batch = item["rows"][start : start + BATCH_SIZE]
+                    cursor.executemany(insert_sql, batch)
 
                 results.append({
                     "table_name": table_name,
@@ -342,10 +356,8 @@ class CSVLoader:
 
     def load_csv(self, workspace_name, filename, file_obj):
         """Convenience method for loading a single CSV."""
-
         results = self.load_multiple(
             workspace_name,
             [(filename, file_obj)],
         )
-
         return results[0]
