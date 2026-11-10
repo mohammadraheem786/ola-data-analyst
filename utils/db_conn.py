@@ -3,7 +3,46 @@ import os
 import pyodbc
 from dotenv import load_dotenv
 
+
+# Load local environment variables.
+# On Streamlit Cloud, credentials will come from Streamlit Secrets.
 load_dotenv()
+
+
+def get_setting(key, default=None):
+    """
+    Read configuration in this order:
+    1. Environment variables (.env locally)
+    2. Streamlit Secrets (deployed application)
+    3. Default value
+    """
+
+    value = os.getenv(key)
+
+    if value is not None:
+        return value
+
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(key, default)
+        return value
+
+    except Exception:
+        return default
+
+
+def odbc_value(value):
+    """
+    Escape an ODBC connection-string value.
+    """
+
+    value = str(value)
+
+    if ";" in value or "}" in value or "{" in value:
+        return "{" + value.replace("}", "}}") + "}"
+
+    return value
 
 
 class DatabaseUtil:
@@ -11,14 +50,22 @@ class DatabaseUtil:
     def __init__(self, db_config=None):
 
         self.db_config = db_config or {
-            "server": os.getenv("DB_SERVER"),
-            "database": os.getenv("DB_NAME"),
-            "driver": os.getenv(
+            "server": get_setting("DB_SERVER"),
+            "database": get_setting("DB_NAME"),
+            "driver": get_setting(
                 "DB_DRIVER",
                 "ODBC Driver 18 for SQL Server"
             ),
-            "user": os.getenv("DB_USER"),
-            "password": os.getenv("DB_PASSWORD")
+            "user": get_setting("DB_USER"),
+            "password": get_setting("DB_PASSWORD"),
+            "encrypt": get_setting("DB_ENCRYPT", "yes"),
+            "trust_server_certificate": get_setting(
+                "DB_TRUST_SERVER_CERTIFICATE",
+                "no"
+            ),
+            "connection_timeout": int(
+                get_setting("DB_CONNECTION_TIMEOUT", "30")
+            )
         }
 
     # ------------------------------------------------
@@ -29,20 +76,40 @@ class DatabaseUtil:
 
         config = self.db_config
 
+        required_fields = ["server", "database"]
+
+        for field in required_fields:
+            if not config.get(field):
+                raise ValueError(
+                    f"Missing database configuration: {field}"
+                )
+
         connection_string = (
             f"DRIVER={{{config['driver']}}};"
-            f"SERVER={config['server']};"
-            f"DATABASE={config['database']};"
-            "TrustServerCertificate=yes;"
+            f"SERVER={odbc_value(config['server'])};"
+            f"DATABASE={odbc_value(config['database'])};"
+            f"Encrypt={config.get('encrypt', 'yes')};"
+            f"TrustServerCertificate="
+            f"{config.get('trust_server_certificate', 'no')};"
+            f"Connection Timeout="
+            f"{config.get('connection_timeout', 30)};"
         )
 
-        if not config.get("user"):
-            connection_string += "Trusted_Connection=yes;"
-        else:
+        if config.get("user"):
+
+            if not config.get("password"):
+                raise ValueError(
+                    "Database password is missing."
+                )
+
             connection_string += (
-                f"UID={config['user']};"
-                f"PWD={config['password']};"
+                f"UID={odbc_value(config['user'])};"
+                f"PWD={odbc_value(config['password'])};"
             )
+
+        else:
+
+            connection_string += "Trusted_Connection=yes;"
 
         return pyodbc.connect(connection_string)
 
@@ -141,7 +208,9 @@ class DatabaseUtil:
 
                 result = cursor.fetchall()
 
-                return str([tuple(row) for row in result])
+                return str([
+                    tuple(row) for row in result
+                ])
 
             connection.commit()
 
